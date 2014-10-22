@@ -1,0 +1,350 @@
+#define _POSIX_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <getopt.h>
+#include <sys/utsname.h>
+#include <sys/stat.h>
+#include <strings.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <stdbool.h>
+/*GLOBAL VARIABLES*/
+#define MAX_READ 1000
+#define RD 0
+#define WR 1
+bool V = false;
+char wordArray[50][MAX_READ];
+int globalcnt;
+int totCharsInPipe[50] = {0};
+
+//function prototypes
+void initWordArray(void);
+void initWordArray(void){
+    int i;
+    int j;
+    for (i = 0; i<= 49; i++) {
+        for (j = 0; j<= MAX_READ-1; j++){
+            wordArray[i][j] = '\0';
+        }
+    }
+}
+void closePipeEND(int);
+void closePipeEND(int xpipe) {
+    if (close(xpipe) == -1)
+        printf("ERROR: close Pipe in %ld\n", (long) getpid() );
+}
+void assignPipe (int, int);
+void assignPipe (int xpipe, int STD) {
+    if (xpipe != STD) {              /* Defensive check */
+        if (dup2(xpipe, STD) == -1)
+            printf("ERROR: dup2 1\n");
+        if (close(xpipe) == -1)
+            printf("ERROR: close 4\n");
+    }
+}
+//reference: http://www.programmingsimplified.com/c/program/c-program-change-case
+void lower_string(char *);
+void lower_string(char *string)
+{
+    while(*string)
+    {
+        if ( *string >= 'A' && *string <= 'Z' )
+        {
+            *string = *string + 32;
+        }
+        string++;
+    }
+}
+void readAndParseSTDIN(int, int parserPipe[][2]);
+void readAndParseSTDIN(int numSubProcs, int parserPipe[][2]){
+    FILE *fp[numSubProcs+1];
+    char line[MAX_READ];
+    int i;
+    for (i = 1; i <= numSubProcs; i++) {
+        fp[i] = fdopen(parserPipe[i][WR], "w");//converts readFD into a file pointer
+    }
+    //loops through stdin, putting one line per child
+    i = 1;
+    while (scanf("%99[A-Za-z]%*[^A-Za-z]", line) != EOF){
+        lower_string(line);
+        fprintf(fp[i], "%s\n", line);
+        totCharsInPipe[i] = totCharsInPipe[i] + strlen(line);
+        i++;
+        if (i > numSubProcs) i = 1;
+    }
+    for (i = 1; i <= numSubProcs; i++) {
+        fflush(fp[i]);
+    }
+}
+bool readNextWord(int, FILE *fp[]);
+bool readNextWord(int numSubProcs, FILE *fp[]){
+    int i;
+    char line[MAX_READ];
+    //add 1 word from each child to wordarray
+    for (i = 1; i <= numSubProcs; i++) {
+        if (strcmp(wordArray[i], "") == 0) {
+            if (fscanf(fp[i], "%[^\n]%*c", line) >= 1){
+                strcpy(wordArray[i], line);
+            }
+        }
+    }
+    //if array has word in it, return true
+    for (i = 1; i <= numSubProcs; i++) {
+        if (strcmp(wordArray[i], "") != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+int bestWordIndex(int);
+int bestWordIndex(int numSubProcs){//returns earliest alpha word from wordArray.
+    int i;
+    int besti;
+    //find first non empty i, call it best i
+    for (i = 1; i <= numSubProcs; i++) {
+        if (strcmp(wordArray[i], "") != 0){
+            besti = i;
+            break;
+        }
+    }
+    for (i = besti; i <= numSubProcs; i++) {
+        if (strcmp(wordArray[i], "") != 0) {
+            if (strcmp(wordArray[i], wordArray[besti])<0) {
+                besti = i;
+            }
+        }
+    }
+    return besti;
+}
+void printAndRemoveWord(int, FILE *fp);
+void printAndRemoveWord(int numSubProcs, FILE *fp){
+    int i;
+    i = bestWordIndex(numSubProcs);
+    fprintf(fp, "%s\n", wordArray[i]);
+    memset(wordArray[i], 0, MAX_READ);
+}
+void justprint(int uniqPipe[]);
+void justprint(int uniqPipe[2]) {
+    char line[MAX_READ];
+    FILE *fp;
+    
+    fp = fdopen(uniqPipe[RD], "r");//converts readFD into a file pointer
+    while (fscanf(fp, "%[^\n]%*c", line) >= 1){
+        if (V)printf("justprint: %d, %s\n", globalcnt, line);
+        printf("%s\n", line);
+    }
+}
+void parser(int);
+void parser(int numSubProcs){
+    int i,j;
+    pid_t childPid;
+    int parserPipe[50][2];
+    int mergerPipe[50][2];
+    int uniqPipe[2];
+    FILE *fp[numSubProcs+1];
+    FILE *fpUniq;
+    
+    if(V) printf("parent PID = %ld\n",(long) getpid() );
+    
+    /*open pipes*/
+    for (i = 1; i <= numSubProcs ; i++) {
+        pipe(parserPipe[i]); //open parser pipe i
+        pipe(mergerPipe[i]); //open merger pipe i
+    }
+    pipe(uniqPipe); // for feeding output to Uniq -c
+
+    switch (fork()) {   //fork parser process
+        case -1:
+            perror("ERROR");
+        case 0:     /*child*/
+            if(V) printf("parserChild: PID = %ld\n", (long) getpid());
+            closePipeEND(uniqPipe[RD]); //not needed in here
+            closePipeEND(uniqPipe[WR]); //not needed in here
+            for (i = 1; i <= numSubProcs; i++) {
+                closePipeEND(parserPipe[i][RD]); //not needed in here
+                closePipeEND(mergerPipe[i][RD]); //not needed in here
+                closePipeEND(mergerPipe[i][WR]); //not needed in here
+           }
+            
+            //reads directly from STDIN, writes to parserpipe
+            readAndParseSTDIN(numSubProcs, parserPipe);
+            for (i = 1; i <= numSubProcs; i++) {
+                closePipeEND(parserPipe[i][WR]); //done with writing
+                if(V)printf("totCharsInpipe: %d = %d\n", i, totCharsInPipe[i]);
+            }
+            exit(EXIT_SUCCESS); //assume all pipes get closed on exit
+        default: /* Parent falls through*/
+            break;
+    }
+    /*fork sort subprocesses and plumb the sort pipes*/
+    for (i = 1; i <= numSubProcs ; i++) {
+        switch (fork()) {   //fork subprocess i
+            case -1:
+                perror("ERROR");
+            case 0:     /*child*/
+                if(V) printf("sortChild %d PID = %ld\n", i, (long) getpid() );
+                for (j = 1; j <= numSubProcs ; j++) {
+                    if (i != j) { // close pipes meant for other children
+                        closePipeEND(parserPipe[j][RD]);
+                        closePipeEND(parserPipe[j][WR]);
+                        closePipeEND(mergerPipe[j][RD]);
+                        closePipeEND(mergerPipe[j][WR]);
+                    }
+                }
+                closePipeEND(parserPipe[i][WR]); //will not write to parser
+                closePipeEND(mergerPipe[i][RD]); //Will not read from merger
+                closePipeEND(uniqPipe[RD]); //not needed in sort
+                closePipeEND(uniqPipe[WR]); //not needed in sort
+
+                assignPipe(parserPipe[i][RD], STDIN_FILENO); //parser to STDIN
+                assignPipe(mergerPipe[i][WR], STDOUT_FILENO); // merger: STDOUT
+                
+                //sleep(5);
+                execlp("sort", "sort", (char *) NULL); /* Writes to pipe */
+                printf("ERROR: execlp rev"); //should never execute
+            default:            /* Parent falls through to create next child */
+           break;
+        }
+        if(V) printf("parent PID = %ld, after sort\n",(long) getpid() );
+    }
+    for (i = 1; i <= numSubProcs; i++) {
+        closePipeEND(parserPipe[i][RD]); // Parent - no read from parser
+        closePipeEND(parserPipe[i][WR]); // Parent - no write to parser
+        closePipeEND(mergerPipe[i][WR]); // Parent - no write to merger
+    }
+    /*fork merger process and plumb the merger pipes*/
+    switch (fork()) {
+        case -1:
+            perror("ERROR");
+        case 0:     /*child*/
+            if(V) printf("mergerChild PID = %ld\n", (long) getpid() );
+            
+            for (i = 1; i <= numSubProcs; i++) {
+                fp[i] = fdopen(mergerPipe[i][RD], "r");//converts mergerPipe into a file pointer
+            }
+            /*fork new process for uniq*/
+            switch (fork()) {
+                case -1:
+                    perror("ERROR");
+                case 0:
+                    if(V) printf("uniqChild PID = %ld\n", (long) getpid() );
+                    for (i = 1; i <= numSubProcs ; i++)
+                        closePipeEND(mergerPipe[i][RD]); //Don't need in Uniq
+                    closePipeEND(uniqPipe[WR]); // Dont not write into
+                    
+                    assignPipe(uniqPipe[RD], STDIN_FILENO); //Uniq to STDIN
+                    execlp("uniq", "uniq", "-c", (char *) NULL); /* Writes to pipe */
+                    printf("ERROR: execlp rev"); //should never execute
+                default:
+                    closePipeEND(uniqPipe[RD]); // merger child doesnt read
+                    break;
+            }
+            fpUniq = fdopen(uniqPipe[WR], "w");//converts readFD into a file pointer
+            initWordArray();
+            while (readNextWord(numSubProcs, fp) == true){//at least one word
+                printAndRemoveWord(numSubProcs, fpUniq);//next in alpha order
+            }
+            fflush(fpUniq);
+            closePipeEND(uniqPipe[WR]); // parent(merger) done with writing
+
+            for (i = 1; i <= numSubProcs ; i++)
+                closePipeEND(mergerPipe[i][RD]); // Done with reading, close
+
+            exit(EXIT_SUCCESS); //assume all pipes get closed on exit
+            
+        default:            /* Parent falls through to create next child */
+            for (i = 1; i <= numSubProcs ; i++)
+                closePipeEND(mergerPipe[i][RD]); // Parent - no write to merger
+            closePipeEND(uniqPipe[RD]); // grand-parent doesnt need uniq pipe
+            closePipeEND(uniqPipe[WR]); // grand-parent doesnt need uniq pipe
+            break;
+    }
+    /*wait on children*/
+    while((childPid = wait(NULL)) != -1)
+        continue;
+}
+int main(int argc, char *argv[]){
+    char c;
+    int numSubProcs = 1;    //if user does not enter value, 1 is default
+
+    while((c = getopt(argc, argv, "n:v" )) !=-1) { //number required after n, but n is not required
+        switch (c) {
+            case 'n':
+                numSubProcs = atoi(optarg);
+                break;
+            case 'v':
+                V = true;
+                break;
+            default:
+                printf("Unknown option\n");
+                return 1;
+        }
+    }
+    parser(numSubProcs);
+    return 0;
+}
+
+//readAndMerge(numSubProcs, mergerPipe);
+//bytesRead = read(mergerPipe[i][0], line, MAX_READ);
+//if (bytesRead == -1)
+//printf("ERROR: reading error\n");
+//if (bytesRead == 0){
+//    printf("BREAK");
+//    //break;
+//}
+//bytesRead = read(mergerPipe[i][0], line, MAX_READ);
+//printf("%s (printed by mergerpipe)\n", line);
+//write(parserPipe[i][1], "atest1\n", sizeof("atest1\n"));
+//write(parserPipe[i][1], "btest2\n", sizeof("btest2\n"));
+//write(parserPipe[i][1], "ctest3\n", sizeof("ctest1\n"));
+
+//                read(STDIN_FILENO, line, MAX_READ);
+//write(STDOUT_FILENO, line, MAX_READ);
+//                read(STDIN_FILENO, line, MAX_READ);
+//                write(STDOUT_FILENO, line, MAX_READ);
+//fprintf(stdout, "%s", line);
+
+//                fp = fdopen(parserPipe[i][0], "r");
+//                fscanf(fp, "%[^\n]%*c", line);
+//                printf("%s\n", line);
+//                fscanf(fp, "%[^\n]%*c", line);
+//                printf("%s\n", line);
+//read(parserPipe[i][0], line, MAX_READ);
+//write(STDOUT_FILENO, line, MAX_READ);
+//read(parserPipe[i][0], line, MAX_READ);
+//write(STDOUT_FILENO, line, MAX_READ);
+
+//    for (i = 1; i <= numSubProcs ; i++) {
+//        if (close(mergerPipe[i][0]) == -1)  /*Close read end of merger */
+//            printf("ERROR: close mergerPipe");
+//    }
+
+
+//fprintf(fp, "btesting1\n");
+//fprintf(fp, "atesting2\n");
+
+//void readAndMerge(int numSubProcs, int mergerpipe[][2]){
+//    int bytesRead;
+//    char line[MAX_READ] = "xx";
+//    for (;;) {
+//        bytesRead = read(mergerpipe[1][0], line, MAX_READ);
+//        if (bytesRead == -1)
+//            printf("ERROR: reading error\n");
+//        if (bytesRead == 0){
+//            printf("BREAK");
+//            break;
+//        }
+//        printf("%s", line);
+//
+//    }
+//}
+//            for (i = 1; i <= numSubProcs ; i++) {
+//                //closePipeEND(parserPipe[i][WR]); //unnessary inheritance
+//                closePipeEND(mergerPipe[i][WR]); //will not write to merger
+//            }
+//            closePipeEND(parserPipe[i][RD]); //Will not read from parser
+//            closePipeEND(mergerPipe[i][RD]); //Will not read from merger
+//            closePipeEND(mergerPipe[i][WR]); //Will not write to merger
+/* instead of stdin, reads from pipe (parser); close duplicated descriptor */
